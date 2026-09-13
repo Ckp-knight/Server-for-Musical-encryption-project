@@ -1,0 +1,7 @@
+bin/
+obj/
+
+# Never commit Firebase / Google service-account keys
+*serviceAccount*.json
+*firebase*adminsdk*.json
+google-credentials.json

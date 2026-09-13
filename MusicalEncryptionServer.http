@@ -1,0 +1,66 @@
+@host = http://localhost:5266
+@userId = user-123
+
+### Register a new account
+POST {{host}}/api/users
+Content-Type: application/json
+
+{
+  "username": "orenk",
+  "password": "Passw0rd!"
+}
+
+### Log in with that account
+POST {{host}}/api/users/login
+Content-Type: application/json
+
+{
+  "username": "orenk",
+  "password": "Passw0rd!"
+}
+
+### Wrong password (expect 401)
+POST {{host}}/api/users/login
+Content-Type: application/json
+
+{
+  "username": "orenk",
+  "password": "WrongPass1"
+}
+
+### List my records
+GET {{host}}/api/encryption
+X-User-Id: {{userId}}
+
+### Encrypt + store something
+# @name encrypt
+POST {{host}}/api/encryption
+Content-Type: application/json
+X-User-Id: {{userId}}
+
+{
+  "title": "My first secret",
+  "plainText": "meet me at noon",
+  "key": "do-re-mi"
+}
+
+### Get the full record that was just created
+GET {{host}}/api/encryption/{{encrypt.response.body.id}}
+X-User-Id: {{userId}}
+
+### Decrypt it
+POST {{host}}/api/encryption/{{encrypt.response.body.id}}/decrypt
+Content-Type: application/json
+X-User-Id: {{userId}}
+
+{
+  "key": "do-re-mi"
+}
+
+### Someone else cannot read it (expect 403)
+GET {{host}}/api/encryption/{{encrypt.response.body.id}}
+X-User-Id: someone-else
+
+### Delete it
+DELETE {{host}}/api/encryption/{{encrypt.response.body.id}}
+X-User-Id: {{userId}}
