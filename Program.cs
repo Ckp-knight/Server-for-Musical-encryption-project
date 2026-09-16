@@ -86,12 +86,43 @@ if (app.Environment.IsDevelopment())
     app.MapGet("/dev/users", async (IUserRepository users) =>
     {
         var all = await users.GetAllAsync();
-        return all.Select(u => new UserSummary(u.Id, u.Username, u.CreatedAt));
+        return all.Select(u => new UserSummary(u.Id, u.Username, u.CreatedAt, u.LastLoginAt, u.IsBanned));
     }).ExcludeFromDescription();
     // The trash button in the "Registered users" panel calls this.
     app.MapDelete("/dev/users/{id}", async (string id, IUserRepository users) =>
         await users.DeleteAsync(id) ? Results.NoContent() : Results.NotFound())
         .ExcludeFromDescription();
+    // The per-row menu's "Change password" action: force-sets a password, no old-password check.
+    app.MapPost("/dev/users/{id}/password", async (string id, DevSetPasswordRequest body, IUserRepository users, IPasswordHasher hasher) =>
+    {
+        var user = await users.GetByIdAsync(id);
+        if (user is null) return Results.NotFound();
+
+        var (hash, salt) = hasher.Hash(body.NewPassword);
+        user.PasswordHash = hash;
+        user.PasswordSalt = salt;
+        return Results.NoContent();
+    }).ExcludeFromDescription();
+    // The per-row menu's "Ban / Unban" action: toggles the flag Login checks.
+    app.MapPost("/dev/users/{id}/ban", async (string id, IUserRepository users) =>
+    {
+        var user = await users.GetByIdAsync(id);
+        if (user is null) return Results.NotFound();
+
+        user.IsBanned = !user.IsBanned;
+        return Results.Ok(new { user.IsBanned });
+    }).ExcludeFromDescription();
+    // The per-row menu's "Reset" action: deletes every encryption record owned by this user.
+    app.MapDelete("/dev/users/{id}/records", async (string id, IUserRepository users, IEncryptionRepository records) =>
+    {
+        var user = await users.GetByIdAsync(id);
+        if (user is null) return Results.NotFound();
+
+        var mine = await records.GetByOwnerAsync(user.Username);
+        foreach (var record in mine)
+            await records.DeleteAsync(record.Id);
+        return Results.Ok(new { deleted = mine.Count });
+    }).ExcludeFromDescription();
 }
 
 // Logs one line per request: method, path, user, status code, milliseconds.

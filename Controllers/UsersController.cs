@@ -57,7 +57,7 @@ public class UsersController : ControllerBase
         _logger.LogInformation("Registered new user {Username} ({UserId})", user.Username, user.Id);
 
         return CreatedAtAction(nameof(GetById), new { id = user.Id },
-            new UserSummary(user.Id, user.Username, user.CreatedAt));
+            new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned));
     }
 
     [HttpPost("login")]
@@ -80,8 +80,41 @@ public class UsersController : ControllerBase
         if (user is null || !_hasher.Verify(request.Password, user.PasswordHash, user.PasswordSalt))
             return Unauthorized("Invalid username or password.");
 
+        if (user.IsBanned)
+            return StatusCode(StatusCodes.Status403Forbidden, "This account has been banned.");
+
+        user.LastLoginAt = DateTimeOffset.UtcNow;
+
         _logger.LogInformation("User {Username} logged in", user.Username);
-        return new UserSummary(user.Id, user.Username, user.CreatedAt);
+        return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);
+    }
+
+    [HttpPost("change-password")]
+    [EndpointSummary("Change an account's password")]
+    [EndpointDescription(
+        "Body: Username, OldPassword (must match the current password) and NewPassword (8+ chars). " +
+        "On success the new password takes effect immediately — log in again with POST /api/users/login.")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    public async Task<ActionResult<UserSummary>> ChangePassword([FromBody] ChangePasswordRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.NewPassword) || request.NewPassword.Length < 8)
+            return BadRequest("New password must be at least 8 characters.");
+
+        var user = await _users.GetByUsernameAsync(request.Username, ct);
+
+        // Same message whether the username doesn't exist or the old password is wrong —
+        // same reasoning as Login above.
+        if (user is null || !_hasher.Verify(request.OldPassword, user.PasswordHash, user.PasswordSalt))
+            return Unauthorized("Invalid username or old password.");
+
+        var (hash, salt) = _hasher.Hash(request.NewPassword);
+        user.PasswordHash = hash;
+        user.PasswordSalt = salt;
+
+        _logger.LogInformation("User {Username} changed their password", user.Username);
+        return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);
     }
 
     [HttpGet("{id}")]
@@ -92,6 +125,6 @@ public class UsersController : ControllerBase
     {
         var user = await _users.GetByIdAsync(id, ct);
         if (user is null) return NotFound();
-        return new UserSummary(user.Id, user.Username, user.CreatedAt);
+        return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);
     }
 }
