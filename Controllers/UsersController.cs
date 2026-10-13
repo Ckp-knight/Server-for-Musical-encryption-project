@@ -84,6 +84,7 @@ public class UsersController : ControllerBase
             return StatusCode(StatusCodes.Status403Forbidden, "This account has been banned.");
 
         user.LastLoginAt = DateTimeOffset.UtcNow;
+        await _users.UpdateAsync(user, ct);
 
         _logger.LogInformation("User {Username} logged in", user.Username);
         return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);
@@ -112,6 +113,7 @@ public class UsersController : ControllerBase
         var (hash, salt) = _hasher.Hash(request.NewPassword);
         user.PasswordHash = hash;
         user.PasswordSalt = salt;
+        await _users.UpdateAsync(user, ct);
 
         _logger.LogInformation("User {Username} changed their password", user.Username);
         return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);

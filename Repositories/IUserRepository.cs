@@ -11,6 +11,13 @@ public interface IUserRepository
     /// <returns>false if the username is already taken.</returns>
     Task<bool> AddAsync(User user, CancellationToken ct = default);
 
+    /// <summary>
+    /// Persists changes made to a previously-loaded <see cref="User"/> (password change,
+    /// ban toggle, LastLoginAt, ...). Required because, unlike the in-memory store, Firestore
+    /// does not hand back a live reference you can mutate in place.
+    /// </summary>
+    Task UpdateAsync(User user, CancellationToken ct = default);
+
     /// <summary>Everyone registered. Used only by the dev control panel — not part of the public API.</summary>
     Task<IReadOnlyList<User>> GetAllAsync(CancellationToken ct = default);
 

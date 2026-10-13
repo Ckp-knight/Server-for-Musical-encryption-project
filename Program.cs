@@ -41,18 +41,14 @@ builder.Services.AddOpenApi(options =>
 });
 
 // --- Database layer ---------------------------------------------------------
-// Build and test against the in-memory store now.
-// When Firestore is ready, change ONLY this line to:
-//   builder.Services.AddSingleton<IEncryptionRepository, FirestoreEncryptionRepository>();
-builder.Services.AddSingleton<IEncryptionRepository, InMemoryEncryptionRepository>();
+builder.Services.AddSingleton<IEncryptionRepository, FirestoreEncryptionRepository>();
 
 // --- Encryption algorithm -------------------------------------------------------
 // TODO: swap the placeholder for the real musical-encryption algorithm.
 builder.Services.AddSingleton<IMusicalCipher, PlaceholderMusicalCipher>();
 
 // --- Users --------------------------------------------------------------------
-// Same story: in-memory now, swap for a Firestore-backed IUserRepository later.
-builder.Services.AddSingleton<IUserRepository, InMemoryUserRepository>();
+builder.Services.AddSingleton<IUserRepository, FirestoreUserRepository>();
 builder.Services.AddSingleton<IPasswordHasher, Pbkdf2PasswordHasher>();
 
 // --- Dev control panel ----------------------------------------------------------
@@ -101,6 +97,7 @@ if (app.Environment.IsDevelopment())
         var (hash, salt) = hasher.Hash(body.NewPassword);
         user.PasswordHash = hash;
         user.PasswordSalt = salt;
+        await users.UpdateAsync(user);
         return Results.NoContent();
     }).ExcludeFromDescription();
     // The per-row menu's "Ban / Unban" action: toggles the flag Login checks.
@@ -110,6 +107,7 @@ if (app.Environment.IsDevelopment())
         if (user is null) return Results.NotFound();
 
         user.IsBanned = !user.IsBanned;
+        await users.UpdateAsync(user);
         return Results.Ok(new { user.IsBanned });
     }).ExcludeFromDescription();
     // The per-row menu's "Reset" action: deletes every encryption record owned by this user.

@@ -33,6 +33,14 @@ public class InMemoryUserRepository : IUserRepository
         return Task.FromResult(true);
     }
 
+    public Task UpdateAsync(User user, CancellationToken ct = default)
+    {
+        // Mutations already apply in place (we hand out the same object reference), but we
+        // still write it back so behavior matches FirestoreUserRepository's contract.
+        _byId[user.Id] = user;
+        return Task.CompletedTask;
+    }
+
     public Task<IReadOnlyList<User>> GetAllAsync(CancellationToken ct = default)
     {
         IReadOnlyList<User> all = _byId.Values.OrderBy(u => u.CreatedAt).ToList();
