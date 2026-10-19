@@ -15,7 +15,12 @@ public record DevSetPasswordRequest(string NewPassword);
 
 public record UserSummary(
     string Id,
-    [property: Description("Use this value as the X-User-Id header on /api/encryption calls.")] string Username,
+    string Username,
     DateTimeOffset CreatedAt,
     DateTimeOffset? LastLoginAt,
     bool IsBanned);
+
+public record LoginResponse(
+    UserSummary User,
+    [property: Description("Send this as \"Authorization: Bearer <token>\" on every /api/encryption call.")] string Token,
+    DateTimeOffset ExpiresAtUtc);

@@ -1,5 +1,9 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using MusicalEncryptionServer.Models;
 using MusicalEncryptionServer.Repositories;
 using MusicalEncryptionServer.Services;
@@ -13,21 +17,21 @@ public class UsersController : ControllerBase
 {
     private readonly IUserRepository _users;
     private readonly IPasswordHasher _hasher;
+    private readonly IJwtTokenService _tokens;
     private readonly ILogger<UsersController> _logger;
 
-    public UsersController(IUserRepository users, IPasswordHasher hasher, ILogger<UsersController> logger)
+    public UsersController(IUserRepository users, IPasswordHasher hasher, IJwtTokenService tokens, ILogger<UsersController> logger)
     {
         _users = users;
         _hasher = hasher;
+        _tokens = tokens;
         _logger = logger;
     }
 
+    [EnableRateLimiting("auth")]
     [HttpPost]
     [EndpointSummary("Register a new account")]
-    [EndpointDescription(
-        "Body: Username (3-20 chars) and Password (8+ chars). No X-User-Id header needed here — " +
-        "there's no user yet. On success, log in separately with POST /api/users/login to get a " +
-        "usable X-User-Id for the /api/encryption endpoints.")]
+    [EndpointDescription("Body: Username (3-20 chars) and Password (8+ chars). On success, log in separately with POST /api/users/login to get a bearer token for the /api/encryption endpoints.")]
     [ProducesResponseType(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status409Conflict)]
@@ -60,15 +64,16 @@ public class UsersController : ControllerBase
             new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned));
     }
 
+    [EnableRateLimiting("auth")]
     [HttpPost("login")]
     [EndpointSummary("Check a username + password")]
     [EndpointDescription(
-        "Body: Username and Password of an account created via POST /api/users. On success, use " +
-        "the returned Username as the X-User-Id header on every /api/encryption call.")]
+        "Body: Username and Password of an account created via POST /api/users. On success, send " +
+        "the returned Token as the \"Authorization: Bearer <token>\" header on every /api/encryption call.")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-    public async Task<ActionResult<UserSummary>> Login([FromBody] LoginRequest request, CancellationToken ct)
+    public async Task<ActionResult<LoginResponse>> Login([FromBody] LoginRequest request, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password))
             return BadRequest("Username and password are required.");
@@ -87,9 +92,13 @@ public class UsersController : ControllerBase
         await _users.UpdateAsync(user, ct);
 
         _logger.LogInformation("User {Username} logged in", user.Username);
-        return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);
+
+        var token = _tokens.IssueToken(user);
+        var summary = new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);
+        return new LoginResponse(summary, token.Value, token.ExpiresAtUtc);
     }
 
+    [EnableRateLimiting("auth")]
     [HttpPost("change-password")]
     [EndpointSummary("Change an account's password")]
     [EndpointDescription(
@@ -119,12 +128,20 @@ public class UsersController : ControllerBase
         return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);
     }
 
+    [Authorize]
     [HttpGet("{id}")]
-    [EndpointSummary("Look up an account by id")]
+    [EndpointSummary("Look up your own account by id")]
+    [EndpointDescription("Requires a bearer token from /api/users/login. Only the authenticated user may look up their own id — any other id returns 403.")]
     [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult<UserSummary>> GetById(string id, CancellationToken ct)
     {
+        var callerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
+        if (callerId != id)
+            return StatusCode(StatusCodes.Status403Forbidden, "You may only look up your own account.");
+
         var user = await _users.GetByIdAsync(id, ct);
         if (user is null) return NotFound();
         return new UserSummary(user.Id, user.Username, user.CreatedAt, user.LastLoginAt, user.IsBanned);

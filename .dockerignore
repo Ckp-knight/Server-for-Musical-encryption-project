@@ -1,0 +1,18 @@
+bin/
+obj/
+.git/
+.vs/
+.vscode/
+*.user
+MusicalEncryptionServer.Tests/
+
+# Local-only configuration and secrets — never baked into the image.
+appsettings.Development.json
+*serviceAccount*.json
+*firebase*adminsdk*.json
+google-credentials.json
+**/secrets.json
+
+Dockerfile
+.dockerignore
+README.md

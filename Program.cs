@@ -1,3 +1,9 @@
+using System.Text;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
 using MusicalEncryptionServer.Diagnostics;
 using MusicalEncryptionServer.Middleware;
 using MusicalEncryptionServer.Models;
@@ -6,6 +12,15 @@ using MusicalEncryptionServer.Services;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Cloud Run injects PORT and expects the container to listen on 0.0.0.0:$PORT.
+// Locally PORT isn't set, so this is a no-op and launchSettings.json / ASPNETCORE_URLS
+// (http://localhost:5266) keep controlling the address as before.
+var cloudRunPort = Environment.GetEnvironmentVariable("PORT");
+if (!string.IsNullOrEmpty(cloudRunPort))
+{
+    builder.WebHost.UseUrls($"http://0.0.0.0:{cloudRunPort}");
+}
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi(options =>
@@ -55,8 +70,77 @@ builder.Services.AddSingleton<IPasswordHasher, Pbkdf2PasswordHasher>();
 // Keeps the last 200 requests in memory so /dev can show a live feed of them.
 builder.Services.AddSingleton<IRequestLogStore, InMemoryRequestLogStore>();
 
+// --- JWT authentication ---------------------------------------------------------
+builder.Services.AddOptions<JwtOptions>()
+    .Bind(builder.Configuration.GetSection(JwtOptions.SectionName));
+builder.Services.AddSingleton<IJwtTokenService, JwtTokenService>();
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer();
+
+// Configured via IOptions<JwtOptions> (resolved lazily, after the DI container is fully
+// built) rather than a plain local variable read from builder.Configuration beforehand —
+// that would capture configuration as it stood before builder.Build() runs, which is too
+// early for sources added by some hosts (e.g. the test host's WebApplicationFactory).
+builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme)
+    .Configure<IOptions<JwtOptions>>((bearerOptions, jwtOptionsAccessor) =>
+    {
+        var jwt = jwtOptionsAccessor.Value;
+        bearerOptions.MapInboundClaims = false; // keep short claim names ("sub") as issued, not ClaimTypes.*
+        bearerOptions.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidIssuer = jwt.Issuer,
+            ValidateAudience = true,
+            ValidAudience = jwt.Audience,
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.FromSeconds(jwt.ClockSkewSeconds),
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwt.SigningKey)),
+            // Only accept the algorithm we sign with — blocks "alg: none" and algorithm-confusion attacks.
+            ValidAlgorithms = new[] { SecurityAlgorithms.HmacSha256 },
+        };
+    });
+builder.Services.AddAuthorization();
+
+// --- Rate limiting ----------------------------------------------------------------
+// Register/Login/ChangePassword are anonymous by necessity (see Controllers/UsersController.cs),
+// so they're the one place still open to unlimited guessing/brute-force from a single caller.
+// Partitioned per client IP so one abusive caller can't also lock out everyone else.
+builder.Services.AddOptions<AuthRateLimitOptions>().Bind(builder.Configuration.GetSection("AuthRateLimit"));
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("auth", httpContext =>
+    {
+        // Resolved per-request (post-Build()) rather than captured at registration time,
+        // so hosts that add configuration later (e.g. TestWebApplicationFactory) are honored.
+        var limit = httpContext.RequestServices.GetRequiredService<IOptions<AuthRateLimitOptions>>().Value;
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = limit.PermitLimit,
+                Window = TimeSpan.FromSeconds(limit.WindowSeconds),
+                QueueLimit = 0,
+            });
+    });
+});
+
 var app = builder.Build();
 
+// Force JwtTokenService to construct now (its constructor validates Jwt:Issuer,
+// Jwt:Audience and Jwt:SigningKey) so missing/invalid JWT configuration fails
+// startup instead of the first /api/users/login call.
+app.Services.GetRequiredService<IJwtTokenService>();
+
+// #if DEBUG means a `dotnet build/publish -c Release` binary (what Dockerfile produces for
+// Cloud Run) has this code — Scalar, OpenAPI, and the whole /dev control panel — compiled
+// out entirely. A misconfigured ASPNETCORE_ENVIRONMENT=Development on a Release-built
+// container can no longer resurrect it; there is no code there to run. The runtime
+// app.Environment.IsDevelopment() check is kept too (defense in depth for Debug builds,
+// e.g. an accidental `dotnet run` with the wrong environment variable locally).
+#if DEBUG
 if (app.Environment.IsDevelopment())
 {
     // Raw OpenAPI document at /openapi/v1.json ...
@@ -111,6 +195,11 @@ if (app.Environment.IsDevelopment())
         return Results.Ok(new { user.IsBanned });
     }).ExcludeFromDescription();
     // The per-row menu's "Reset" action: deletes every encryption record owned by this user.
+    // NOTE (OwnerUserId migration): records created before JWT auth was added store
+    // OwnerUserId = username; records created since store OwnerUserId = the immutable
+    // User.Id (see Controllers/EncryptionController.cs CallerId). GetByOwnerAsync below is
+    // called with the username, so this button only still finds/deletes the old-style
+    // records. No data was migrated — see CLOUD_SECURITY_NOTES.md for why and what's left.
     app.MapDelete("/dev/users/{id}/records", async (string id, IUserRepository users, IEncryptionRepository records) =>
     {
         var user = await users.GetByIdAsync(id);
@@ -122,19 +211,38 @@ if (app.Environment.IsDevelopment())
         return Results.Ok(new { deleted = mine.Count });
     }).ExcludeFromDescription();
 }
+#endif
+
+// In Production, turn any unhandled exception into a generic, constant 500 JSON body
+// instead of whatever ASP.NET Core's bare default happens to return — the framework
+// already doesn't leak stack traces outside Development, but this makes "don't leak
+// details" an explicit, testable behavior rather than an implicit default to trust.
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler(errorApp => errorApp.Run(async context =>
+    {
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new { error = "An unexpected error occurred." });
+    }));
+}
 
 // Logs one line per request: method, path, user, status code, milliseconds.
 app.UseMiddleware<RequestLoggingMiddleware>();
+
+app.UseRateLimiter();
 
 // No HTTPS locally: we run plain HTTP on one port (see ASPNETCORE_URLS), which
 // avoids the "trust the localhost certificate" Windows prompt. When you deploy,
 // the hosting platform terminates HTTPS for you; re-add app.UseHttpsRedirection()
 // then if you also expose an HTTPS port.
+app.UseAuthentication();
 app.UseAuthorization();
 app.MapControllers();
 
 app.Run();
 
+#if DEBUG
 // Creates the "admin" dev account only if it doesn't exist yet — never a second time.
 // This is the same "check, then create" shape you'll use once this repository is
 // Firestore-backed: a plain unconditional AddAsync would either duplicate the
@@ -153,3 +261,7 @@ static async Task SeedDevAccountAsync(IServiceProvider services)
     var (hash, salt) = hasher.Hash(password);
     await users.AddAsync(new User { Username = username, PasswordHash = hash, PasswordSalt = salt });
 }
+#endif
+
+// Exposes the top-level-statements entry point to WebApplicationFactory<Program> in tests.
+public partial class Program { }
