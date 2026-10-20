@@ -1,4 +1,5 @@
 using Google.Cloud.Firestore;
+using Microsoft.Extensions.Configuration;
 using MusicalEncryptionServer.Models;
 
 namespace MusicalEncryptionServer.Repositories;

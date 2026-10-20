@@ -1,44 +1,11 @@
-using MusicalEncryptionServer.Diagnostics;
-using MusicalEncryptionServer.Middleware;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using MusicalEncryptionServer.Models;
 using MusicalEncryptionServer.Repositories;
 using MusicalEncryptionServer.Services;
-using Scalar.AspNetCore;
+using MusicalEncryptionServer.Sockets;
 
-var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddControllers();
-builder.Services.AddOpenApi(options =>
-{
-    // This becomes the "how do I use this page" text at the very top of the
-    // Scalar UI (http://localhost:5266/scalar/v1), above the endpoint list.
-    options.AddDocumentTransformer((document, _, _) =>
-    {
-        document.Info.Title = "Musical Encryption Server";
-        document.Info.Version = "v1";
-        document.Info.Description = """
-            **This page is a test console for the server — not the app itself.**
-            Use it to try each endpoint by hand and see exactly what it sends/returns.
-            The real program is the WPF client (Musical-Encryption-Project).
-
-            ### How to read a request panel
-            - **Parameters** — things like `X-User-Id` that go in the URL/headers. Hover the ⓘ
-              next to a field's name for what it means.
-            - **Body** — the JSON sent for POST requests. Each field has a grey description
-              under it explaining what to put there.
-            - **Responses** (right side) — every status code this endpoint can return, and why.
-
-            ### Try it in this order
-            1. `POST /api/users` — create an account (Username, Password).
-            2. `POST /api/users/login` — log in with the same Username/Password.
-            3. Copy that Username into the **X-User-Id** field for every call below —
-               it stands in for real login until authentication is added.
-            4. `POST /api/encryption` — encrypt some text; copy the returned **Id**.
-            5. `POST /api/encryption/{id}/decrypt` — paste that Id and the same Key to get the text back.
-            """;
-        return Task.CompletedTask;
-    });
-});
+var builder = Host.CreateApplicationBuilder(args);
 
 // --- Database layer ---------------------------------------------------------
 builder.Services.AddSingleton<IEncryptionRepository, FirestoreEncryptionRepository>();
@@ -50,96 +17,28 @@ builder.Services.AddSingleton<IMusicalCipher, PlaceholderMusicalCipher>();
 // --- Users --------------------------------------------------------------------
 builder.Services.AddSingleton<IUserRepository, FirestoreUserRepository>();
 builder.Services.AddSingleton<IPasswordHasher, Pbkdf2PasswordHasher>();
+builder.Services.AddSingleton<UserService>();
 
-// --- Dev control panel ----------------------------------------------------------
-// Keeps the last 200 requests in memory so /dev can show a live feed of them.
-builder.Services.AddSingleton<IRequestLogStore, InMemoryRequestLogStore>();
+// --- Socket server ---------------------------------------------------------
+builder.Services.AddSingleton<RequestRouter>();
+builder.Services.AddHostedService<TcpSocketServer>();
 
-var app = builder.Build();
+var host = builder.Build();
 
-if (app.Environment.IsDevelopment())
+if (builder.Environment.IsDevelopment())
 {
-    // Raw OpenAPI document at /openapi/v1.json ...
-    app.MapOpenApi();
-    // ... and a clickable UI to try every endpoint at /scalar/v1
-    app.MapScalarApiReference(options => options.WithTitle("Musical Encryption — API Console"));
-
     // Dev-only convenience account, matching the WPF client's logo quick-fill
     // (admin / Admin1234). Seeded once here — the client never registers it —
     // so clicking the logo always logs in instead of creating a fresh user
     // every launch. See SeedDevAccountAsync below for why that matters.
-    await SeedDevAccountAsync(app.Services);
-
-    // --- Dev control panel: open http://localhost:5266/dev directly in a browser tab ---
-    // This is a page to look at, not an API to call from Scalar — .ExcludeFromDescription()
-    // keeps it out of the OpenAPI document so it doesn't show up in Scalar's endpoint list
-    // (Scalar only shows a raw response body anyway; it doesn't run the page's JavaScript).
-    // Dev-only: none of this is mapped when the app isn't in Development.
-    app.MapGet("/dev", () => Results.Content(DevDashboardHtml.Content, "text/html"))
-        .ExcludeFromDescription();
-    app.MapGet("/dev/requests", (IRequestLogStore store) => store.GetRecent())
-        .ExcludeFromDescription();
-    app.MapGet("/dev/users", async (IUserRepository users) =>
-    {
-        var all = await users.GetAllAsync();
-        return all.Select(u => new UserSummary(u.Id, u.Username, u.CreatedAt, u.LastLoginAt, u.IsBanned));
-    }).ExcludeFromDescription();
-    // The trash button in the "Registered users" panel calls this.
-    app.MapDelete("/dev/users/{id}", async (string id, IUserRepository users) =>
-        await users.DeleteAsync(id) ? Results.NoContent() : Results.NotFound())
-        .ExcludeFromDescription();
-    // The per-row menu's "Change password" action: force-sets a password, no old-password check.
-    app.MapPost("/dev/users/{id}/password", async (string id, DevSetPasswordRequest body, IUserRepository users, IPasswordHasher hasher) =>
-    {
-        var user = await users.GetByIdAsync(id);
-        if (user is null) return Results.NotFound();
-
-        var (hash, salt) = hasher.Hash(body.NewPassword);
-        user.PasswordHash = hash;
-        user.PasswordSalt = salt;
-        await users.UpdateAsync(user);
-        return Results.NoContent();
-    }).ExcludeFromDescription();
-    // The per-row menu's "Ban / Unban" action: toggles the flag Login checks.
-    app.MapPost("/dev/users/{id}/ban", async (string id, IUserRepository users) =>
-    {
-        var user = await users.GetByIdAsync(id);
-        if (user is null) return Results.NotFound();
-
-        user.IsBanned = !user.IsBanned;
-        await users.UpdateAsync(user);
-        return Results.Ok(new { user.IsBanned });
-    }).ExcludeFromDescription();
-    // The per-row menu's "Reset" action: deletes every encryption record owned by this user.
-    app.MapDelete("/dev/users/{id}/records", async (string id, IUserRepository users, IEncryptionRepository records) =>
-    {
-        var user = await users.GetByIdAsync(id);
-        if (user is null) return Results.NotFound();
-
-        var mine = await records.GetByOwnerAsync(user.Username);
-        foreach (var record in mine)
-            await records.DeleteAsync(record.Id);
-        return Results.Ok(new { deleted = mine.Count });
-    }).ExcludeFromDescription();
+    await SeedDevAccountAsync(host.Services);
 }
 
-// Logs one line per request: method, path, user, status code, milliseconds.
-app.UseMiddleware<RequestLoggingMiddleware>();
-
-// No HTTPS locally: we run plain HTTP on one port (see ASPNETCORE_URLS), which
-// avoids the "trust the localhost certificate" Windows prompt. When you deploy,
-// the hosting platform terminates HTTPS for you; re-add app.UseHttpsRedirection()
-// then if you also expose an HTTPS port.
-app.UseAuthorization();
-app.MapControllers();
-
-app.Run();
+await host.RunAsync();
 
 // Creates the "admin" dev account only if it doesn't exist yet — never a second time.
-// This is the same "check, then create" shape you'll use once this repository is
-// Firestore-backed: a plain unconditional AddAsync would either duplicate the
-// account or throw a "document already exists" error against a real database on
-// every restart. Doing the check here means the seed is safe against both.
+// This is a "check, then create" shape so the seed is safe to run on every
+// restart against a real (Firestore) database, not just an in-memory one.
 static async Task SeedDevAccountAsync(IServiceProvider services)
 {
     const string username = "admin";

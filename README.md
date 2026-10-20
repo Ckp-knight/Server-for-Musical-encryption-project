@@ -1,7 +1,9 @@
 # Musical Encryption Server
 
-ASP.NET Core (.NET 9) Web API. The server encrypts text, stores records, and
-enforces per-user permissions. Clients never talk to the database directly.
+A plain .NET 9 console app (generic host, no ASP.NET Core/Kestrel). It listens
+for raw TCP connections, speaks a small length-prefixed JSON protocol, and
+runs the exact same business logic (hashing, Firestore storage) that used to
+sit behind HTTP controllers.
 
 ## Run
 
@@ -9,61 +11,61 @@ enforces per-user permissions. Clients never talk to the database directly.
 dotnet run
 ```
 
-The client identifies itself with an `X-User-Id` header (temporary — see TODO).
+Listens on TCP port `5300`, on all local interfaces — any number of clients
+can connect at once (see `Sockets/TcpSocketServer.cs`).
+
+## Wire protocol
+
+Every message, in both directions, is a 4-byte big-endian length prefix
+followed by that many bytes of UTF-8 JSON (`Sockets/MessageProtocol.cs`):
+
+- **Request**: `{ "Action": "register" | "login" | "changePassword", "Payload": {...} }`
+- **Response**: `{ "Success": bool, "StatusCode": int, "Error": string?, "Payload": {...}? }`
+
+`Sockets/RequestRouter.cs` maps `Action` to a `UserService` call. The CLIENT
+project keeps a byte-for-byte identical copy of `MessageProtocol.cs` — if one
+side changes the shape, the other must change too.
 
 ## Debugging / seeing what the server does
 
-1. **Interactive API UI (Scalar)** — while the server runs (Development), open
-   `http://localhost:5266/scalar/v1`. Every endpoint is listed; fill in the body
-   and the `X-User-Id` header, press Send, see the response. Raw OpenAPI JSON is
-   at `/openapi/v1.json`.
-2. **Step-by-step debugger** — in VS Code press **F5** (needs the *C# Dev Kit*
-   extension). Set breakpoints in `EncryptionController.cs` and step through line
-   by line, inspecting every variable. Config is in `.vscode/launch.json`.
-3. **Request log** — the console prints one line in and one line out for every
-   request (method, path, user, status, milliseconds). See
-   `Middleware/RequestLoggingMiddleware.cs`.
-4. `MusicalEncryptionServer.http` — send the sample requests straight from VS Code.
+1. **Step-by-step debugger** — in VS Code press **F5** (needs the *C# Dev
+   Kit* extension). Set breakpoints in `Sockets/ClientSession.cs` or
+   `Services/UserService.cs` and step through line by line. Config is in
+   `.vscode/launch.json`.
+2. **Console log** — one line per accepted connection and per request
+   (action + resulting status code), printed via the standard
+   `Microsoft.Extensions.Logging` console logger.
 
 ## Project layout
 
 | Folder / file | What it is |
 | --- | --- |
-| `Controllers/EncryptionController.cs` | HTTP endpoints, validation, permission checks |
+| `Sockets/TcpSocketServer.cs` | `TcpListener` + accept loop; one task per connected client |
+| `Sockets/ClientSession.cs` | Owns one client's connection: read request, route it, write response |
+| `Sockets/RequestRouter.cs` | Maps an `Action` string to a `UserService` call |
+| `Sockets/MessageProtocol.cs` | The framing + request/response envelope shared with the CLIENT |
+| `Services/UserService.cs` | Register / login / change-password business logic (no transport-specific code) |
 | `Services/IMusicalCipher.cs` | The encryption algorithm, behind an interface |
 | `Services/PlaceholderMusicalCipher.cs` | **Temporary** XOR+Base64 so it runs. Replace with the real algorithm |
-| `Repositories/IEncryptionRepository.cs` | What the server needs from the database |
-| `Repositories/InMemoryEncryptionRepository.cs` | Current storage — a dictionary, lost on restart |
-| `Repositories/FirestoreEncryptionRepository.cs` | Firestore storage — **not implemented yet**, step-by-step notes inside |
-| `Models/EncryptionRecord.cs` | The stored document (one per record) |
-| `Models/User.cs` | A registered account — password stored only as a salted hash |
 | `Services/Pbkdf2PasswordHasher.cs` | Hashes/verifies passwords (PBKDF2, built into .NET) |
-| `Repositories/IUserRepository.cs` / `InMemoryUserRepository.cs` | Same in-memory-now pattern as the encryption records |
-| `Controllers/UsersController.cs` | Register + login |
-| `Middleware/RequestLoggingMiddleware.cs` | Logs every request (method, user, status, timing) |
-| `Program.cs` | Wires everything together (dependency injection) |
+| `Repositories/IEncryptionRepository.cs` / `FirestoreEncryptionRepository.cs` | Encryption record storage (not yet wired to a socket action) |
+| `Repositories/IUserRepository.cs` / `FirestoreUserRepository.cs` | User storage, permanent (Google Cloud Firestore) |
+| `Models/User.cs` | A registered account — password stored only as a salted hash |
+| `Models/EncryptionRecord.cs` | The stored encryption record shape (one per record) |
+| `Program.cs` | Wires everything together (dependency injection) and starts the host |
 
-## Endpoints
+## Actions implemented over the socket protocol
 
-| Method | Path | Purpose |
+Only the three flows the WPF CLIENT actually calls today:
+
+| Action | Payload | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/users` | Register a new account |
-| `POST` | `/api/users/login` | Check username+password |
-| `POST` | `/api/encryption` | Encrypt + store, returns new id |
-| `GET` | `/api/encryption` | List my records (summaries) |
-| `GET` | `/api/encryption/{id}` | Get one full record (owner only) |
-| `POST` | `/api/encryption/{id}/decrypt` | Decrypt with a key (owner only) |
-| `DELETE` | `/api/encryption/{id}` | Delete (owner only) |
+| `register` | `{ Username, Password }` | Create a new account |
+| `login` | `{ Username, Password }` | Check username + password |
+| `changePassword` | `{ Username, OldPassword, NewPassword }` | Change an account's password |
 
-## Switching to Firestore later
-
-1. `dotnet add package Google.Cloud.Firestore`
-2. Create the Firebase project, download the service-account JSON key (keep it
-   out of git — `.gitignore` already blocks common names).
-3. Set env var `GOOGLE_APPLICATION_CREDENTIALS` to the key file path.
-4. Put the project id in `appsettings.json` -> `Firestore:ProjectId`.
-5. Implement the four methods in `FirestoreEncryptionRepository.cs`.
-6. In `Program.cs`, change the one registration line from
-   `InMemoryEncryptionRepository` to `FirestoreEncryptionRepository`.
-
-Nothing else in the project changes.
+The Encryption repository/cipher/DTOs still exist (`Repositories/IEncryptionRepository.cs`,
+`Services/IMusicalCipher.cs`, `Models/Dtos.cs`) but have no socket action wired
+to them yet — the CLIENT has no UI for them either. Adding one later means:
+add a method to a new `EncryptionService`, add a `case` in `RequestRouter`,
+no changes to the socket plumbing itself.
